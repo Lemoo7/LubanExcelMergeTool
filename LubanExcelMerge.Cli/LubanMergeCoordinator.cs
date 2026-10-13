@@ -30,7 +30,7 @@ public sealed record MergeRunResult(
     public bool Succeeded => Conflicts.Count == 0 && OutputPath is not null;
 }
 
-public sealed class LubanMergeCoordinator
+public sealed partial class LubanMergeCoordinator
 {
     private const string SingletonRecordKey = "__single_record__";
     private readonly GitLfsInputResolver _lfsResolver;
@@ -253,7 +253,12 @@ public sealed class LubanMergeCoordinator
     {
         try
         {
-            var schemas = ParseSchemas(sheets.Base, sheets.Local, sheets.Remote);
+            var columnLayout = IsColumnLayout(sheets.Base) || IsColumnLayout(sheets.Local) || IsColumnLayout(sheets.Remote);
+            if (columnLayout && (configuredKey is not null || ignoredFields.Count > 0 || options.ValidateLogicalTableUniqueness))
+                throw new UnsafeWorkbookException("纵向表按字段名合并，暂不支持 keyOverrides、ignoredFields 或跨文件唯一性扫描。");
+            var schemas = columnLayout
+                ? ParseColumnSchemas(sheets.Base, sheets.Local, sheets.Remote)
+                : ParseSchemas(sheets.Base, sheets.Local, sheets.Remote, metadata, logicalTable);
             var schemaMerge = CreateSchemaMergePlan(schemas, sheets);
             var metadataPlan = CreateMetadataPlan(
                 sheets,
@@ -272,7 +277,8 @@ public sealed class LubanMergeCoordinator
                 CreateRecordSources(sheets.Local, schemaMerge, SchemaSide.Local, localPath, dataRows[1]),
                 CreateRecordSources(sheets.Remote, schemaMerge, SchemaSide.Remote, remotePath, dataRows[2])
             };
-            var isSingleton = string.Equals(logicalTable.Mode, "one", StringComparison.OrdinalIgnoreCase);
+            var isSingleton = !columnLayout && (string.Equals(logicalTable.Mode, "one", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(logicalTable.Mode, "singleton", StringComparison.OrdinalIgnoreCase));
             RecordKeyDefinition keyDefinition;
             if (isSingleton)
             {
@@ -287,8 +293,16 @@ public sealed class LubanMergeCoordinator
             }
             else
             {
-                var keyCandidates = (configuredKey is null
-                        ? logicalTable.DeclaredIndexes
+                var declaredIndexes = logicalTable.DeclaredIndexes;
+                if (!columnLayout && !logicalTable.ReadSchemaFromFile && declaredIndexes.Count == 0 && configuredKey is null)
+                {
+                    var xmlFields = XmlBeanCatalog.Load(Path.Combine(Path.GetDirectoryName(metadata.DataRoot)!, "Defines")).Resolve(logicalTable);
+                    declaredIndexes = new[] { new RecordKeyDefinition(new[] { xmlFields[0].Name }) };
+                }
+                var keyCandidates = (columnLayout
+                        ? new[] { new RecordKeyDefinition(new[] { "字段名" }) }
+                        : configuredKey is null
+                        ? declaredIndexes
                         : new[] { new RecordKeyDefinition(configuredKey) })
                     .Select(candidate => new RecordKeyDefinition(candidate.FieldNames
                         .Select(fieldName => MapFieldName(schemaMerge, fieldName))))
@@ -340,6 +354,16 @@ public sealed class LubanMergeCoordinator
                 CreateDataset(schemaMerge, SchemaSide.Local, keyDefinition, ignoredFieldSet, dataRows[1]),
                 CreateDataset(schemaMerge, SchemaSide.Remote, keyDefinition, ignoredFieldSet, dataRows[2])
             };
+            if (!columnLayout && string.Equals(logicalTable.Mode, "list", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (var side in datasets.Skip(1))
+                {
+                    var common = datasets[0].ByKey.Keys.Intersect(side.ByKey.Keys).ToHashSet();
+                    if (!datasets[0].Records.Where(record => common.Contains(record.Record.Key)).Select(record => record.Record.Key)
+                        .SequenceEqual(side.Records.Where(record => common.Contains(record.Record.Key)).Select(record => record.Record.Key)))
+                        throw new UnsafeWorkbookException("mode=list 的记录顺序发生变化；列表顺序可能有业务含义，请先统一顺序后合并。");
+                }
+            }
             datasets[1] = NormalizeStructurallyDeletedFieldData(
                 datasets[0], datasets[1], schemaMerge, SchemaSide.Local);
             datasets[2] = NormalizeStructurallyDeletedFieldData(
@@ -377,7 +401,8 @@ public sealed class LubanMergeCoordinator
                 plan.DeletedRecords,
                 schemaMerge.Conflicts.Count + metadataPlan.Conflicts.Count,
                 schemaMerge.StructuralChanges,
-                () => CreateFinalEdits(
+                columnLayout ? () => automaticEdits.Concat(conflicts.SelectMany(conflict => conflict.GetSelectedEdits())).ToArray()
+                : () => CreateFinalEdits(
                     sheets,
                     schemaMerge,
                     automaticEdits,
@@ -565,6 +590,9 @@ public sealed class LubanMergeCoordinator
             try
             {
                 siblingSchema = ParseSchema(sheet);
+                if (!logicalTable.ReadSchemaFromFile)
+                    siblingSchema = XmlBeanCatalog.Load(Path.Combine(Path.GetDirectoryName(metadata.DataRoot)!, "Defines")).Apply(siblingSchema, logicalTable);
+                siblingSchema = NormalizeSchema(siblingSchema);
             }
             catch (FormatException exception)
             {
@@ -638,7 +666,9 @@ public sealed class LubanMergeCoordinator
     {
         if (!string.IsNullOrEmpty(table.Mode) &&
             !string.Equals(table.Mode, "map", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals(table.Mode, "one", StringComparison.OrdinalIgnoreCase))
+            !string.Equals(table.Mode, "one", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(table.Mode, "singleton", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(table.Mode, "list", StringComparison.OrdinalIgnoreCase))
             throw new UnsafeWorkbookException($"逻辑表 {table.FullName} 的模式 {table.Mode} 尚不能安全地在无界面模式下合并。");
     }
 
@@ -670,27 +700,54 @@ public sealed class LubanMergeCoordinator
         {
             throw new UnsafeWorkbookException("BASE、LOCAL、REMOTE 的工作表名称、数量或顺序不一致。");
         }
-        return Enumerable.Range(0, baseNames.Length)
+        var sets = Enumerable.Range(0, baseNames.Length)
             .Select(index => (@base.Sheets[index], local.Sheets[index], remote.Sheets[index]))
             .ToArray();
+        var dataSheets = new List<(SheetSnapshot, SheetSnapshot, SheetSnapshot)>();
+        foreach (var (baseSheet, localSheet, remoteSheet) in sets)
+        {
+            if (HasSchemaMarker(baseSheet) || HasSchemaMarker(localSheet) || HasSchemaMarker(remoteSheet))
+            {
+                dataSheets.Add((baseSheet, localSheet, remoteSheet));
+                continue;
+            }
+            // Never silently discard edits to a sheet whose record identity is unknown.
+            if (!SheetContentEquals(baseSheet, localSheet) || !SheetContentEquals(baseSheet, remoteSheet) ||
+                !AuxiliaryPartsEqual(@base, baseSheet, local, localSheet) || !AuxiliaryPartsEqual(@base, baseSheet, remote, remoteSheet))
+                throw new UnsafeWorkbookException($"辅助工作表 {localSheet.Name} 没有 Luban 字段标记且内容或格式发生变化，无法按主键安全合并。请先单独处理该页的变化。");
+        }
+        if (dataSheets.Count == 0)
+            throw new UnsafeWorkbookException("工作簿没有可识别的 Luban 数据工作表（##var 或 ##column##var）。");
+        return dataSheets;
     }
 
     private static (LubanSchema Base, LubanSchema Local, LubanSchema Remote) ParseSchemas(
         SheetSnapshot @base,
         SheetSnapshot local,
-        SheetSnapshot remote)
+        SheetSnapshot remote,
+        MetadataLocation metadata,
+        LogicalTableDefinition table)
     {
-        try
+        XmlBeanCatalog? xml = null;
+        if (!table.ReadSchemaFromFile)
         {
-            return (
-                NormalizeSchema(ParseSchema(@base)),
-                NormalizeSchema(ParseSchema(local)),
-                NormalizeSchema(ParseSchema(remote)));
+            try { xml = XmlBeanCatalog.Load(Path.Combine(Path.GetDirectoryName(metadata.DataRoot)!, "Defines")); }
+            catch (Exception exception) when (exception is FormatException or System.Xml.XmlException or IOException)
+            { throw new UnsafeWorkbookException($"读取逻辑表 {table.FullName} 的 XML 定义失败：{exception.Message}", exception); }
         }
-        catch (FormatException exception)
+        LubanSchema ParseSide(SheetSnapshot sheet, string side)
         {
-            throw new UnsafeWorkbookException("无法识别 Luban 表头。", exception);
+            try
+            {
+                var schema = ParseSchema(sheet);
+                return NormalizeSchema(xml is null ? schema : xml.Apply(schema, table));
+            }
+            catch (FormatException exception)
+            {
+                throw new UnsafeWorkbookException($"{side} 工作表 {sheet.Name} 无法识别 Luban 表头或 XML 字段映射：{exception.Message}", exception);
+            }
         }
+        return (ParseSide(@base, "BASE"), ParseSide(local, "LOCAL"), ParseSide(remote, "REMOTE"));
     }
 
     private static LubanSchema ParseSchema(SheetSnapshot sheet)
@@ -1146,7 +1203,6 @@ public sealed class LubanMergeCoordinator
             sourceSchema.MetadataRows
                 .OrderBy(metadata => metadata.RowNumber)
                 .Select(metadata => sourceSheet.GetRow(metadata.RowNumber))
-                .Where(row => row is not null)
                 .Select(row => new RowWrite(
                     CreateAlignedCellArray(row, sourceSchema, schemaMerge, sourceSide)
                         .Select((payload, column) => new CellWrite(

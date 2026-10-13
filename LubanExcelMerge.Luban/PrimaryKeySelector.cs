@@ -16,7 +16,8 @@ public static class PrimaryKeySelector
     {
         var candidates = declaredIndexes.Count > 0
             ? declaredIndexes
-            : schema.Fields.Take(1).Select(field => new RecordKeyDefinition(new[] { field.Name })).ToArray();
+            : schema.Fields.Where(field => !field.Name.StartsWith('#')).Take(1)
+                .Select(field => new RecordKeyDefinition(new[] { field.Name })).ToArray();
         var attempts = new List<RecordKeyValidationResult>();
 
         foreach (var candidate in candidates)

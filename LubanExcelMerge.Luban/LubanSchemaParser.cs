@@ -13,11 +13,7 @@ public sealed record LubanSchema(
     bool IsRestricted,
     IReadOnlyList<string> Restrictions)
 {
-    private readonly IReadOnlyDictionary<string, LubanField> _fieldsByName = Fields
-        .GroupBy(field => field.Name, StringComparer.Ordinal)
-        .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
-
-    public LubanField? FindField(string name) => _fieldsByName.GetValueOrDefault(name);
+    public LubanField? FindField(string name) => Fields.FirstOrDefault(field => field.Name == name);
 }
 
 public static class LubanSchemaParser
@@ -28,9 +24,18 @@ public static class LubanSchemaParser
         if (rows.Count == 0)
             throw new FormatException("工作表为空，无法识别 Luban 表头。");
 
-        var metadataRows = rows.TakeWhile(IsMetadataRow).ToArray();
-        if (metadataRows.Length == 0)
+        var ordered = rows.OrderBy(row => row.RowNumber).ToArray();
+        var prefix = ordered.TakeWhile(row => IsMetadataRow(row) || row.Cells.All(string.IsNullOrWhiteSpace)).ToArray();
+        if (!prefix.Any(IsMetadataRow))
             throw new FormatException("工作表顶部没有连续的 Luban 元数据区。");
+
+        // Keep physical row positions, including omitted XML rows. The merge editor
+        // replaces the complete prefix, so skipping blank rows would shift data.
+        var lastMetadata = prefix.Last(IsMetadataRow).RowNumber;
+        var byNumber = prefix.ToDictionary(row => row.RowNumber);
+        var metadataRows = Enumerable.Range(1, lastMetadata)
+            .Select(number => byNumber.GetValueOrDefault(number) ?? new LubanRawRow(number, Array.Empty<string?>()))
+            .ToArray();
 
         var variableRows = metadataRows.Where(row => GetMarker(row) == "##var").ToArray();
         if (variableRows.Length == 0)
@@ -42,8 +47,12 @@ public static class LubanSchemaParser
         for (var columnIndex = 0; columnIndex < primaryVariableRow.Cells.Count; columnIndex++)
         {
             var name = primaryVariableRow.Cells[columnIndex] ?? string.Empty;
-            if (string.IsNullOrEmpty(name) || name.StartsWith("##", StringComparison.Ordinal))
+            if (string.IsNullOrWhiteSpace(name) || name.Trim().TrimStart('\uFEFF').StartsWith("##", StringComparison.Ordinal))
                 continue;
+
+            // Comment columns still contain user data to merge, but are not keys
+            // or XML fields. Repeated comment labels are legal in project sheets.
+            if (name.StartsWith('#')) name = $"{name}@column{columnIndex + 1}";
 
             var typeName = typeRow is not null && columnIndex < typeRow.Cells.Count
                 ? typeRow.Cells[columnIndex] ?? string.Empty
@@ -72,5 +81,5 @@ public static class LubanSchemaParser
     private static bool IsMetadataRow(LubanRawRow row) => GetMarker(row).StartsWith("##", StringComparison.Ordinal);
 
     private static string GetMarker(LubanRawRow row) =>
-        row.Cells.FirstOrDefault(cell => !string.IsNullOrEmpty(cell)) ?? string.Empty;
+        (row.Cells.FirstOrDefault(cell => !string.IsNullOrWhiteSpace(cell)) ?? string.Empty).Trim().TrimStart('\uFEFF');
 }

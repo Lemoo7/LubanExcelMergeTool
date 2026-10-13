@@ -6,7 +6,11 @@ public static class LubanKeyValueNormalizer
 {
     public static string? Normalize(LubanField field, string? value)
     {
-        if (IsBoolean(field.TypeName))
+        var typeName = field.TypeName.Split('#')[0].TrimEnd('!');
+        // Nullable keys must retain the distinction between null and zero.
+        if (typeName.EndsWith('?'))
+            return string.IsNullOrEmpty(value) ? value : Normalize(field with { TypeName = typeName[..^1] }, value);
+        if (IsBoolean(typeName))
         {
             if (string.IsNullOrEmpty(value))
                 return "0";
@@ -17,7 +21,7 @@ public static class LubanKeyValueNormalizer
             return value;
         }
 
-        if (!IsNumeric(field.TypeName))
+        if (!IsNumeric(typeName))
             return value;
         if (string.IsNullOrEmpty(value))
             return "0";

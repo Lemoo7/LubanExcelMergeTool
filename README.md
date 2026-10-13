@@ -11,6 +11,7 @@
 - 上一处/下一处冲突定位及自动合并结果循环定位
 - 单元格、整行和整列批量选择 BASE/LOCAL/REMOTE
 - 多 Sheet 切换与整工作簿保存门禁
+- XML 外部字段定义、嵌套 bean 继承、纵向表和未变化辅助页兼容（见兼容性说明）
 - 新增行、删除行、修改和删除/修改冲突处理；REMOTE 新增行尽量保留原相对位置
 - LOCAL/REMOTE 任意位置新增 Luban 字段列及字段并集合并
 - 既有字段列删除、重命名、类型修改和位置移动的三方合并与冲突选择
@@ -51,7 +52,7 @@ dotnet run --project LubanExcelMerge.Cli.Tests -c Release
 dotnet run --project LubanExcelMerge.Gui.Tests -c Release
 ```
 
-当前基线为 `145` 项测试。样式修复说明见 [本地修复记录](docs/Style-Fix-1.2.2.1.zh-CN.md)。
+当前基线为 `146` 项测试。样式修复说明见 [本地修复记录](docs/Style-Fix-1.2.2.1.zh-CN.md)。
 
 ## 发布
 
@@ -66,6 +67,7 @@ dotnet publish LubanExcelMerge.Gui/LubanExcelMerge.Gui.csproj `
 ## 文档
 
 - [用户手册](docs/LubanExcelMerge-User-Guide.zh-CN.md)
+- [项目表格兼容性与限制](docs/Compatibility-2026-10.zh-CN.md)
 - [Fork / Git 集成](docs/Fork-Git-Integration.zh-CN.md)
 - [配置示例](docs/luban-excel-merge.example.json)
 

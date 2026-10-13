@@ -78,6 +78,7 @@ try
 {
     var tests = new List<(string Name, Action Run)>
     {
+        ("legacy XML, column layout, header gaps and auxiliary sheet regressions", () => CompatibilityRegressionTests.Run(testRoot)),
         ("command line requires four files and repository", CommandLineRequiresInputs),
         ("command line accepts Fork arguments without merge subcommand", CommandLineAcceptsForkArgumentsWithoutSubcommand),
         ("command line still rejects unknown subcommands", CommandLineRejectsUnknownSubcommands),
